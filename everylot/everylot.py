@@ -16,10 +16,17 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 from __future__ import unicode_literals
-import sqlite3
+
 import logging
+import math
+import sqlite3
 from io import BytesIO
+
+import googlemaps
+import googlemaps.maps
 import requests
+import shapely.geometry
+import shapely.wkb
 
 QUERY = """SELECT
     *
@@ -115,6 +122,81 @@ class EveryLot(object):
         sv.seek(0)
         return sv
 
+    def get_maps_image(self, key):
+        client = googlemaps.Client(key)
+
+        shape = shapely.wkb.loads(self.lot["geometry"])
+        parcel = shapely.geometry.mapping(shape)
+
+        if parcel["type"] == "Polygon":
+            polygons = parcel["coordinates"]
+        elif parcel["type"] == "MultiPolygon":
+            polygons = [
+                polygon[0] for polygon in parcel["coordinates"]
+            ]
+        else:
+            raise ValueError(f"Unknown geometry type: {parcel['type']}")
+
+        paths = [
+            googlemaps.maps.StaticMapPath(points=[{"lat": lat, "lng": lng} for lng, lat in polygon])
+            for polygon in polygons
+        ]
+        bounds = self.scale_bounds(shape.bounds, 3)
+        zoom = self.calculate_zoom(bounds, [1000, 1000])
+        resp = client.static_map(
+            size=1000,
+            center={"lat": shape.centroid.y, "lng": shape.centroid.x},
+            path=paths,
+            maptype="roadmap",
+            zoom=zoom,
+        )
+
+        im = BytesIO()
+        for chunk in resp:
+            if chunk:
+                im.write(chunk)
+        im.seek(0)
+        return im
+
+    def scale_bounds(self, bounds, scale_factor):
+        center = [
+            (bounds[2] + bounds[0]) / 2,
+            (bounds[3] + bounds[1]) / 2,
+        ]
+        dimensions = [
+            bounds[2] - bounds[0],
+            bounds[3] - bounds[1],
+        ]
+        return [
+            center[0] - dimensions[0] * scale_factor / 2,
+            center[1] - dimensions[1] * scale_factor / 2,
+            center[0] + dimensions[0] * scale_factor / 2,
+            center[1] + dimensions[1] * scale_factor / 2,
+        ]
+
+    def calculate_zoom(self, bounds, mapDim):
+        """Adapted from https://stackoverflow.com/a/13274361."""
+        WORLD_DIM = { "height": 256, "width": 256 }
+        ZOOM_MAX = 20
+
+        def latRad(lat):
+            sin = math.sin(lat * math.pi / 180)
+            radX2 = math.log((1 + sin) / (1 - sin)) / 2
+            return max(min(radX2, math.pi), -math.pi) / 2
+
+        def zoom(mapPx, worldPx, fraction):
+            return math.floor(math.log(mapPx / worldPx / fraction) / math.log(2))
+
+        latFraction = (latRad(bounds[3]) - latRad(bounds[1])) / math.pi
+
+        lngDiff = bounds[2] - bounds[0]
+        lngFraction = (lngDiff + 360 if lngDiff < 0 else lngDiff) / 360
+
+        latZoom = zoom(mapDim[1], WORLD_DIM["height"], latFraction)
+        lngZoom = zoom(mapDim[0], WORLD_DIM["width"], lngFraction)
+
+        return min(latZoom, lngZoom, ZOOM_MAX)
+
     def streetviewable_location(self, key):
         '''
         Check if google-geocoded address is nearby or not. if not, use the lat/lon
@@ -172,12 +254,12 @@ class EveryLot(object):
             self.logger.info('location with db coords: %s, %s', self.lot['lat'], self.lot['lon'])
             return '{},{}'.format(self.lot['lat'], self.lot['lon'])
 
-    def compose(self, media_id_string):
+    def compose(self, media_ids):
         '''
         Compose a tweet, including media ids and location info.
         :media_id_string str identifier for an image uploaded to Twitter
         '''
-        self.logger.debug("media_id_string: %s", media_id_string)
+        self.logger.debug("media_ids: %s", media_ids)
 
         # Let missing addresses play through here, let the program leak out a bit
         status = self.print_format.format(**self.lot)
@@ -186,7 +268,7 @@ class EveryLot(object):
             "status": status,
             "lat": self.lot.get('lat', 0.),
             "long": self.lot.get('lon', 0.),
-            "media_ids": [media_id_string]
+            "media_ids": media_ids,
         }
 
     def mark_as_tweeted(self, status_id):

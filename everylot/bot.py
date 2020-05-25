@@ -53,12 +53,15 @@ def main():
 
     # Get the streetview image and upload it
     # ("sv.jpg" is a dummy value, since filename is a required parameter).
-    image = el.get_streetview_image(api.config['streetview'])
-    media = api.media_upload('sv.jpg', file=image)
+    sv_image = el.get_streetview_image(api.config['streetview'])
+    sv_media = api.media_upload('sv.jpg', file=sv_image)
+
+    map_image = el.get_maps_image(api.config["streetview"])
+    map_media = api.media_upload("map.png", file=map_image)
 
     # compose an update with all the good parameters
     # including the media string.
-    update = el.compose(media.media_id_string)
+    update = el.compose([sv_media.media_id_string, map_media.media_id_string])
     logger.info(update['status'])
 
     if not args.dry_run:
